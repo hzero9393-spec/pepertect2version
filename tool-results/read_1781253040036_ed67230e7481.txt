@@ -1,0 +1,1580 @@
+     1→// ─── Upstox API v2 Integration ──────────────────────────────────────────────
+     2→// Provides real-time market data, quotes, OHLC, option chain, historical data
+     3→// and order management from Upstox API (https://api.upstox.com)
+     4→//
+     5→// Set UPSTOX_API_KEY and UPSTOX_API_SECRET env variables to enable
+     6→// Falls back to Dhan → Yahoo Finance → DB when not configured
+     7→
+     8→const UPSTOX_BASE_URL = 'https://api.upstox.com'
+     9→const UPSTOX_API_V2 = `${UPSTOX_BASE_URL}/v2`
+    10→const FINANCE_GATEWAY = 'https://internal-api.z.ai'
+    11→const FINANCE_PREFIX = '/external/finance'
+    12→
+    13→// ─── Types ────────────────────────────────────────────────────────────────
+    14→
+    15→export interface UpstoxTokenResponse {
+    16→  status: string
+    17→  data: {
+    18→    access_token: string
+    19→    token_type: string
+    20→    expires_in: number
+    21→    refresh_token: string
+    22→  }
+    23→}
+    24→
+    25→export interface UpstoxProfile {
+    26→  user_id: string
+    27→  user_name: string
+    28→  email: string
+    29→  phone: string
+    30→  pan: string
+    31→  broker: string
+    32→  exchanges: string[]
+    33→  products: string[]
+    34→}
+    35→
+    36→export interface UpstoxQuote {
+    37→  instrument_token: string
+    38→  symbol: string
+    39→  last_price: number
+    40→  ohlc: {
+    41→    open: number
+    42→    high: number
+    43→    low: number
+    44→    close: number
+    45→  }
+    46→  net_change: number
+    47→  volume: number | null
+    48→  average_price: number | null
+    49→  oi: number | null
+    50→  total_buy_quantity: number | null
+    51→  total_sell_quantity: number | null
+    52→  lower_circuit_limit: number | null
+    53→  upper_circuit_limit: number | null
+    54→  last_trade_time: string
+    55→  oi_day_high: number | null
+    56→  oi_day_low: number | null
+    57→  timestamp: string
+    58→  depth: {
+    59→    buy: Array<{ quantity: number; price: number; orders: number }>
+    60→    sell: Array<{ quantity: number; price: number; orders: number }>
+    61→  }
+    62→}
+    63→
+    64→export interface UpstoxOHLC {
+    65→  instrument_token: string
+    66→  exchange: string
+    67→  trading_symbol: string
+    68→  open: number
+    69→  high: number
+    70→  low: number
+    71→  close: number
+    72→  volume: number
+    73→}
+    74→
+    75→export interface UpstoxHistoricalCandle {
+    76→  timestamp: string
+    77→  open: number
+    78→  high: number
+    79→  low: number
+    80→  close: number
+    81→  volume: number
+    82→  oi: number
+    83→}
+    84→
+    85→// Upstox v2 option chain response format
+    86→export interface UpstoxOptionChainItem {
+    87→  expiry: string
+    88→  pcr: number
+    89→  strike_price: number
+    90→  underlying_key: string
+    91→  underlying_spot_price: number
+    92→  call_options: {
+    93→    instrument_key: string
+    94→    market_data: {
+    95→      ltp: number
+    96→      volume: number
+    97→      oi: number
+    98→      close_price: number
+    99→      bid_price: number
+   100→      bid_qty: number
+   101→      ask_price: number
+   102→      ask_qty: number
+   103→      prev_oi: number
+   104→    }
+   105→    option_greeks: {
+   106→      vega: number
+   107→      theta: number
+   108→      gamma: number
+   109→      delta: number
+   110→      iv: number
+   111→      pop: number
+   112→    }
+   113→  } | null
+   114→  put_options: {
+   115→    instrument_key: string
+   116→    market_data: {
+   117→      ltp: number
+   118→      volume: number
+   119→      oi: number
+   120→      close_price: number
+   121→      bid_price: number
+   122→      bid_qty: number
+   123→      ask_price: number
+   124→      ask_qty: number
+   125→      prev_oi: number
+   126→    }
+   127→    option_greeks: {
+   128→      vega: number
+   129→      theta: number
+   130→      gamma: number
+   131→      delta: number
+   132→      iv: number
+   133→      pop: number
+   134→    }
+   135→  } | null
+   136→}
+   137→
+   138→export interface UpstoxOptionChain {
+   139→  underlying_spot_price?: number
+   140→  option_chain: UpstoxOptionChainItem[]
+   141→}
+   142→
+   143→export interface UpstoxPostbackData {
+   144→  order_id: string
+   145→  exchange_order_id: string
+   146→  trading_symbol: string
+   147→  exchange: string
+   148→  transaction_type: string
+   149→  product: string
+   150→  order_type: string
+   151→  quantity: number
+   152→  price: number
+   153→  trigger_price: number
+   154→  status: string
+   155→  filled_quantity: number
+   156→  average_price: number
+   157→  order_request_id: string
+   158→  user_id: string
+   159→  placed_at: string
+   160→  updated_at: string
+   161→  tag: string | null
+   162→}
+   163→
+   164→export interface UpstoxWebhookData {
+   165→  event: string
+   166→  data: {
+   167→    instrument_token: string
+   168→    exchange: string
+   169→    trading_symbol: string
+   170→    ltp: number
+   171→    change: number
+   172→    change_percent: number
+   173→    volume: number
+   174→    oi: number
+   175→    high: number
+   176→    low: number
+   177→    close: number
+   178→    timestamp: string
+   179→  }
+   180→}
+   181→
+   182→// ─── Instrument Key Mapping ──────────────────────────────────────────────
+   183→// Upstox uses instrument_key format: NSE_EQ|IN0001, NSE_FO|43521, NSE_INDEX|Nifty 50
+   184→
+   185→export const NSE_EQ_INSTRUMENT_MAP: Record<string, string> = {
+   186→  RELIANCE: 'NSE_EQ|INE002A01018',
+   187→  TCS: 'NSE_EQ|INE467B01029',
+   188→  HDFCBANK: 'NSE_EQ|INE040A01034',
+   189→  INFY: 'NSE_EQ|INE009A01021',
+   190→  ICICIBANK: 'NSE_EQ|INE090A01021',
+   191→  HINDUNILVR: 'NSE_EQ|INE030A01027',
+   192→  SBIN: 'NSE_EQ|INE062A01020',
+   193→  BHARTIARTL: 'NSE_EQ|INE738A01025',
+   194→  ITC: 'NSE_EQ|INE154A01025',
+   195→  KOTAKBANK: 'NSE_EQ|INE237A01028',
+   196→  LT: 'NSE_EQ|INE018A01030',
+   197→  AXISBANK: 'NSE_EQ|INE238A01034',
+   198→  BAJFINANCE: 'NSE_EQ|INE296A01024',
+   199→  ASIANPAINT: 'NSE_EQ|INE021A01026',
+   200→  MARUTI: 'NSE_EQ|INE585B01010',
+   201→  SUNPHARMA: 'NSE_EQ|INE044A01036',
+   202→  TATAMOTORS: 'NSE_EQ|INE155A01022',
+   203→  WIPRO: 'NSE_EQ|INE075A01022',
+   204→  HCLTECH: 'NSE_EQ|INE860A01027',
+   205→  ULTRACEMCO: 'NSE_EQ|INE237A01028',
+   206→  TITAN: 'NSE_EQ|INE280A01028',
+   207→  NESTLEIND: 'NSE_EQ|INE239A01042',
+   208→  NTPC: 'NSE_EQ|INE733A01031',
+   209→  POWERGRID: 'NSE_EQ|INE752E01010',
+   210→  ONGC: 'NSE_EQ|INE213A01029',
+   211→  TATASTEEL: 'NSE_EQ|INE081A01024',
+   212→  ADANIENT: 'NSE_EQ|INE423A01024',
+   213→  ADANIPORTS: 'NSE_EQ|INE742A01034',
+   214→  JSWSTEEL: 'NSE_EQ|INE019A01033',
+   215→  COALINDIA: 'NSE_EQ|INE522A01034',
+   216→  BPCL: 'NSE_EQ|INE029A01011',
+   217→  HINDALCO: 'NSE_EQ|INE038A01020',
+   218→  GRASIM: 'NSE_EQ|INE049A01031',
+   219→  TECHM: 'NSE_EQ|INE669C01020',
+   220→  BAJAJFINSV: 'NSE_EQ|INE298A01023',
+   221→  DRREDDY: 'NSE_EQ|INE088A01026',
+   222→  CIPLA: 'NSE_EQ|INE043A01027',
+   223→  EICHERMOT: 'NSE_EQ|INE066B01021',
+   224→  TATACONSUM: 'NSE_EQ|INE123A01022',
+   225→  HEROMOTOCO: 'NSE_EQ|INE158A01026',
+   226→  'M&M': 'NSE_EQ|INE101A01026',
+   227→  APOLLOHOSP: 'NSE_EQ|INE437B01018',
+   228→  DIVISLAB: 'NSE_EQ|INE363B01018',
+   229→  BRITANNIA: 'NSE_EQ|INE216A01030',
+   230→  INDUSINDBK: 'NSE_EQ|INE526A01015',
+   231→  HDFCLIFE: 'NSE_EQ|INE744G01013',
+   232→  SBILIFE: 'NSE_EQ|INE123B01016',
+   233→
+   234→  // ─── Extended NSE Stocks ─────────────────────────────────────────────────
+   235→  LICI: 'NSE_EQ|INE051L01022',
+   236→  YESBANK: 'NSE_EQ|INE528G01035',
+   237→  IDFCFIRSTB: 'NSE_EQ|INE092W01024',
+   238→  PNB: 'NSE_EQ|INE160A01015',
+   239→  BANKBARODA: 'NSE_EQ|INE028A01023',
+   240→  CANBK: 'NSE_EQ|INE476A01014',
+   241→  BANKINDIA: 'NSE_EQ|INE004A01021',
+   242→  UNIONBANK: 'NSE_EQ|INE737C01016',
+   243→  INDIANB: 'NSE_EQ|INE569A01029',
+   244→  IDBI: 'NSE_EQ|INE087B01014',
+   245→  SOUTHBANK: 'NSE_EQ|INE058G01012',
+   246→  KTKBANK: 'NSE_EQ|INE797A01012',
+   247→  CUB: 'NSE_EQ|INE585B01016',
+   248→  DCBBANK: 'NSE_EQ|INE605D01014',
+   249→  RBLBANK: 'NSE_EQ|INE874R01013',
+   250→  SHRIRAMFIN: 'NSE_EQ|INE745A01023',
+   251→  'M&MFIN': 'NSE_EQ|INE488C01012',
+   252→  CHOLAFIN: 'NSE_EQ|INE324A01012',
+   253→  'L&TFH': 'NSE_EQ|INE018C01026',
+   254→  IDFC: 'NSE_EQ|INE047D01021',
+   255→  BAJAJHLDNG: 'NSE_EQ|INE298A01023',
+   256→  ADANIPOWER: 'NSE_EQ|INE414E01016',
+   257→  JSWENERGY: 'NSE_EQ|INE149I01012',
+   258→  SUZLON: 'NSE_EQ|INE040D01025',
+   259→  ADANIGREEN: 'NSE_EQ|INE455U01013',
+   260→  ADANITRANS: 'NSE_EQ|INE925H01016',
+   261→  ADANIGAS: 'NSE_EQ|INE894U01014',
+   262→  AWL: 'NSE_EQ|INE984H01012',
+   263→  HINDPETRO: 'NSE_EQ|INE094A01023',
+   264→  OIL: 'NSE_EQ|INE274J01014',
+   265→  GAIL: 'NSE_EQ|INE129B01018',
+   266→  PETRONET: 'NSE_EQ|INE267F01011',
+   267→  GUJGASLTD: 'NSE_EQ|INE057G01012',
+   268→  IGL: 'NSE_EQ|INE206C01011',
+   269→  MGL: 'NSE_EQ|INE023R01011',
+   270→  IOC: 'NSE_EQ|INE241A01010',
+   271→  JSL: 'NSE_EQ|INE247B01021',
+   272→  SAIL: 'NSE_EQ|INE114A01011',
+   273→  NMDC: 'NSE_EQ|INE462B01014',
+   274→  MOIL: 'NSE_EQ|INE563B01012',
+   275→  VEDL: 'NSE_EQ|INE205A01024',
+   276→  HINDZINC: 'NSE_EQ|INE073A01018',
+   277→  JINDALSTEL: 'NSE_EQ|INE204B01017',
+   278→  NATIONALUM: 'NSE_EQ|INE139B01012',
+   279→  HINDCOPPER: 'NSE_EQ|INE531B01012',
+   280→  APLAPOLLO: 'NSE_EQ|INE279M01012',
+   281→  RATNAMANI: 'NSE_EQ|INE078C01015',
+   282→  'BAJAJ-AUTO': 'NSE_EQ|INE269A01018',
+   283→  TVSMOTOR: 'NSE_EQ|INE467D01014',
+   284→  ASHOKLEY: 'NSE_EQ|INE269A01026',
+   285→  MOTHERSON: 'NSE_EQ|INE769A01021',
+   286→  EXIDEIND: 'NSE_EQ|INE049C01016',
+   287→  AMARAJABAT: 'NSE_EQ|INE874A01012',
+   288→  BOSCHLTD: 'NSE_EQ|INE354A01012',
+   289→  MRF: 'NSE_EQ|INE883A01011',
+   290→  APOLLOTYRE: 'NSE_EQ|INE439A01019',
+   291→  CEATLTD: 'NSE_EQ|INE485A01015',
+   292→  JKTYRE: 'NSE_EQ|INE541C01012',
+   293→  BHARATFORG: 'NSE_EQ|INE481A01018',
+   294→  BERGERPAINT: 'NSE_EQ|INE453B01014',
+   295→  AKZOINDIA: 'NSE_EQ|INE036A01018',
+   296→  KANSAINER: 'NSE_EQ|INE549B01012',
+   297→  IDEA: 'NSE_EQ|INE324A01026',
+   298→  GMRINFRA: 'NSE_EQ|INE245B01014',
+   299→  ALOKINDS: 'NSE_EQ|INE060H01015',
+   300→  CENTURYTEX: 'NSE_EQ|INE047A01020',
+   301→  TRIDENT: 'NSE_EQ|INE338B01012',
+   302→  VARDHMAN: 'NSE_EQ|INE510C01018',
+   303→  ARVIND: 'NSE_EQ|INE077A01017',
+   304→  RAYMOND: 'NSE_EQ|INE126A01016',
+   305→  PAGEIND: 'NSE_EQ|INE176H01011',
+   306→  KPRMILL: 'NSE_EQ|INE150K01012',
+   307→  LUXIND: 'NSE_EQ|INE660H01012',
+   308→  WELSPUNIND: 'NSE_EQ|INE180B01023',
+   309→  TRENT: 'NSE_EQ|INE849A01017',
+   310→  ABFRL: 'NSE_EQ|INE065L01013',
+   311→  DMART: 'NSE_EQ|INE407L01015',
+   312→  SHREECEM: 'NSE_EQ|INE070A01013',
+   313→  HAL: 'NSE_EQ|INE095F01014',
+   314→  GODREJCP: 'NSE_EQ|INE193C01024',
+   315→  DABUR: 'NSE_EQ|INE017A01026',
+   316→  COLPAL: 'NSE_EQ|INE259A01012',
+   317→  PGHH: 'NSE_EQ|INE186B01014',
+   318→  EMAMILTD: 'NSE_EQ|INE365B01014',
+   319→  MARICO: 'NSE_EQ|INE196A01026',
+   320→  VBL: 'NSE_EQ|INE749L01014',
+   321→  JUBLFOOD: 'NSE_EQ|INE396G01014',
+   322→  WESTLIFE: 'NSE_EQ|INE306C01013',
+   323→  DEVYANI: 'NSE_EQ|INE01T601012',
+   324→  SAPPHIRE: 'NSE_EQ|INE01SY01014',
+   325→  BARBEQUE: 'NSE_EQ|INE01Q501017',
+   326→  SPECIALLTY: 'NSE_EQ|INE937L01013',
+   327→  INDIGOPNT: 'NSE_EQ|INE01S801013',
+   328→  SHALPAINTS: 'NSE_EQ|INE269C01017',
+   329→  RBA: 'NSE_EQ|INE00Y501014',
+   330→  FORCEMOT: 'NSE_EQ|INE157A01016',
+   331→  GODAWARI: 'NSE_EQ|INE705C01014',
+   332→  LLOYDSME: 'NSE_EQ|INE939L01014',
+   333→}
+   334→
+   335→export const NSE_INDEX_INSTRUMENT_MAP: Record<string, string> = {
+   336→  NIFTY: 'NSE_INDEX|Nifty 50',
+   337→  BANKNIFTY: 'NSE_INDEX|Nifty Bank',
+   338→  FINNIFTY: 'NSE_INDEX|Nifty Fin Service',
+   339→  SENSEX: 'BSE_INDEX|SENSEX',
+   340→  MIDCPNIFTY: 'NSE_INDEX|NIFTY MIDCAP 150',
+   341→}
+   342→
+   343→// ─── Helper Functions ──────────────────────────────────────────────────────
+   344→
+   345→function getApiKey(): string | null {
+   346→  return process.env.UPSTOX_API_KEY || null
+   347→}
+   348→
+   349→function getApiSecret(): string | null {
+   350→  return process.env.UPSTOX_API_SECRET || null
+   351→}
+   352→
+   353→// In-memory token cache to avoid DB reads on every API call
+   354→let cachedAccessToken: string | null = null
+   355→let tokenCacheExpiry = 0
+   356→const TOKEN_CACHE_TTL = 5 * 60 * 1000 // 5 min cache
+   357→
+   358→async function getAccessToken(): Promise<string | null> {
+   359→  // 1. Check cache first
+   360→  if (cachedAccessToken && Date.now() < tokenCacheExpiry) {
+   361→    return cachedAccessToken
+   362→  }
+   363→
+   364→  // 2. Check env var
+   365→  if (process.env.UPSTOX_ACCESS_TOKEN) {
+   366→    cachedAccessToken = process.env.UPSTOX_ACCESS_TOKEN
+   367→    tokenCacheExpiry = Date.now() + TOKEN_CACHE_TTL
+   368→    return cachedAccessToken
+   369→  }
+   370→
+   371→  // 3. Check DB
+   372→  try {
+   373→    const { db } = await import('@/lib/db')
+   374→    const tokenRecord = await db.platformSettings.findUnique({
+   375→      where: { key: 'upstox_access_token' }
+   376→    })
+   377→    if (tokenRecord?.value) {
+   378→      cachedAccessToken = tokenRecord.value
+   379→      tokenCacheExpiry = Date.now() + TOKEN_CACHE_TTL
+   380→      return cachedAccessToken
+   381→    }
+   382→  } catch {}
+   383→
+   384→  return null
+   385→}
+   386→
+   387→export function isUpstoxConfigured(): boolean {
+   388→  return !!(getApiKey() && getApiSecret())
+   389→}
+   390→
+   391→export async function isUpstoxAuthenticated(): Promise<boolean> {
+   392→  const token = await getAccessToken()
+   393→  return !!token
+   394→}
+   395→
+   396→/**
+   397→ * Refresh the Upstox access token using the stored refresh token
+   398→ */
+   399→export async function refreshUpstoxAccessToken(): Promise<{ success: boolean; accessToken?: string; error?: string }> {
+   400→  const apiKey = getApiKey()
+   401→  const apiSecret = getApiSecret()
+   402→  if (!apiKey || !apiSecret) {
+   403→    return { success: false, error: 'Upstox API credentials not configured' }
+   404→  }
+   405→
+   406→  // Get refresh token from DB
+   407→  let refreshToken: string | null = null
+   408→  try {
+   409→    const { db } = await import('@/lib/db')
+   410→    const record = await db.platformSettings.findUnique({
+   411→      where: { key: 'upstox_refresh_token' }
+   412→    })
+   413→    refreshToken = record?.value || null
+   414→  } catch {}
+   415→
+   416→  if (!refreshToken) {
+   417→    return { success: false, error: 'No refresh token available' }
+   418→  }
+   419→
+   420→  try {
+   421→    const res = await fetch(`${UPSTOX_API_V2}/auth/token`, {
+   422→      method: 'POST',
+   423→      headers: {
+   424→        'Content-Type': 'application/x-www-form-urlencoded',
+   425→        'Accept': 'application/json',
+   426→      },
+   427→      body: new URLSearchParams({
+   428→        refresh_token: refreshToken,
+   429→        client_id: apiKey,
+   430→        client_secret: apiSecret,
+   431→        grant_type: 'refresh_token',
+   432→      }),
+   433→    })
+   434→
+   435→    if (!res.ok) {
+   436→      const error = await res.text()
+   437→      console.error('[Upstox] Token refresh failed:', error)
+   438→      return { success: false, error: `Refresh failed: ${error}` }
+   439→    }
+   440→
+   441→    const data = await res.json()
+   442→    const newAccessToken = data?.data?.access_token
+   443→    const newRefreshToken = data?.data?.refresh_token
+   444→
+   445→    if (!newAccessToken) {
+   446→      return { success: false, error: 'No access token in refresh response' }
+   447→    }
+   448→
+   449→    // Store new tokens in DB
+   450→    try {
+   451→      const { db } = await import('@/lib/db')
+   452→      await db.platformSettings.upsert({
+   453→        where: { key: 'upstox_access_token' },
+   454→        update: { value: newAccessToken },
+   455→        create: { key: 'upstox_access_token', value: newAccessToken, description: 'Upstox API OAuth2 access token' },
+   456→      })
+   457→
+   458→      if (newRefreshToken) {
+   459→        await db.platformSettings.upsert({
+   460→          where: { key: 'upstox_refresh_token' },
+   461→          update: { value: newRefreshToken },
+   462→          create: { key: 'upstox_refresh_token', value: newRefreshToken, description: 'Upstox API OAuth2 refresh token' },
+   463→        })
+   464→      }
+   465→
+   466→      // Also store token obtained timestamp
+   467→      await db.platformSettings.upsert({
+   468→        where: { key: 'upstox_token_obtained_at' },
+   469→        update: { value: new Date().toISOString() },
+   470→        create: { key: 'upstox_token_obtained_at', value: new Date().toISOString(), description: 'Timestamp when Upstox token was last obtained/refreshed' },
+   471→      })
+   472→    } catch (dbErr) {
+   473→      console.error('[Upstox] Failed to store refreshed tokens:', dbErr)
+   474→    }
+   475→
+   476→    // Update cache
+   477→    cachedAccessToken = newAccessToken
+   478→    tokenCacheExpiry = Date.now() + TOKEN_CACHE_TTL
+   479→
+   480→    console.log('[Upstox] Token refreshed successfully')
+   481→    return { success: true, accessToken: newAccessToken }
+   482→  } catch (err) {
+   483→    console.error('[Upstox] Token refresh error:', err)
+   484→    return { success: false, error: String(err) }
+   485→  }
+   486→}
+   487→
+   488→/**
+   489→ * Ensure a valid token is available, auto-refreshing if expired
+   490→ */
+   491→export async function ensureValidToken(): Promise<string | null> {
+   492→  // Get current token
+   493→  let token = await getAccessToken()
+   494→
+   495→  if (!token) {
+   496→    // No token at all, try refresh
+   497→    const result = await refreshUpstoxAccessToken()
+   498→    return result.success ? result.accessToken || null : null
+   499→  }
+   500→
+   501→  // Check if token might be expired (check DB for timestamp)
+   502→  try {
+   503→    const { db } = await import('@/lib/db')
+   504→    const obtainedAt = await db.platformSettings.findUnique({
+   505→      where: { key: 'upstox_token_obtained_at' }
+   506→    })
+   507→
+   508→    if (obtainedAt?.value) {
+   509→      const obtainedTime = new Date(obtainedAt.value).getTime()
+   510→      const elapsed = Date.now() - obtainedTime
+   511→      const TOKEN_EXPIRY_MS = 23 * 60 * 60 * 1000 // 23 hours (1 hour buffer before 24h expiry)
+   512→
+   513→      if (elapsed > TOKEN_EXPIRY_MS) {
+   514→        console.log('[Upstox] Token likely expired (obtained', Math.round(elapsed / 3600000), 'hours ago), refreshing...')
+   515→        const result = await refreshUpstoxAccessToken()
+   516→        if (result.success) {
+   517→          return result.accessToken || null
+   518→        }
+   519→        // If refresh fails, still try with existing token
+   520→        console.warn('[Upstox] Token refresh failed, trying with existing token')
+   521→      }
+   522→    }
+   523→  } catch {}
+   524→
+   525→  return token
+   526→}
+   527→
+   528→export function getInstrumentKey(symbol: string, segment: 'NSE_EQ' | 'NSE_INDEX' = 'NSE_EQ'): string | null {
+   529→  if (segment === 'NSE_INDEX') {
+   530→    return NSE_INDEX_INSTRUMENT_MAP[symbol] || null
+   531→  }
+   532→  return NSE_EQ_INSTRUMENT_MAP[symbol] || null
+   533→}
+   534→
+   535→// ─── OAuth2 Flow ────────────────────────────────────────────────────────
+   536→
+   537→/**
+   538→ * Generate Upstox OAuth2 authorization URL
+   539→ */
+   540→export function getUpstoxAuthUrl(redirectUri: string, state?: string): string {
+   541→  const apiKey = getApiKey()
+   542→  if (!apiKey) throw new Error('UPSTOX_API_KEY not configured')
+   543→
+   544→  const params = new URLSearchParams({
+   545→    response_type: 'code',
+   546→    client_id: apiKey,
+   547→    redirect_uri: redirectUri,
+   548→    scope: 'read write',
+   549→  })
+   550→
+   551→  if (state) params.set('state', state)
+   552→
+   553→  return `${UPSTOX_BASE_URL}/v2/auth/authorize?${params.toString()}`
+   554→}
+   555→
+   556→/**
+   557→ * Exchange authorization code for access token
+   558→ */
+   559→export async function exchangeUpstoxAuthCode(code: string, redirectUri: string): Promise<UpstoxTokenResponse> {
+   560→  const apiKey = getApiKey()
+   561→  const apiSecret = getApiSecret()
+   562→  if (!apiKey || !apiSecret) throw new Error('Upstox API credentials not configured')
+   563→
+   564→  const res = await fetch(`${UPSTOX_API_V2}/auth/token`, {
+   565→    method: 'POST',
+   566→    headers: {
+   567→      'Content-Type': 'application/x-www-form-urlencoded',
+   568→      'Accept': 'application/json',
+   569→    },
+   570→    body: new URLSearchParams({
+   571→      code,
+   572→      client_id: apiKey,
+   573→      client_secret: apiSecret,
+   574→      redirect_uri: redirectUri,
+   575→      grant_type: 'authorization_code',
+   576→    }),
+   577→  })
+   578→
+   579→  if (!res.ok) {
+   580→    const error = await res.text()
+   581→    throw new Error(`Upstox token exchange failed: ${error}`)
+   582→  }
+   583→
+   584→  return await res.json()
+   585→}
+   586→
+   587→/**
+   588→ * Get user profile from Upstox
+   589→ */
+   590→export async function getUpstoxProfile(): Promise<UpstoxProfile | null> {
+   591→  const token = await getAccessToken()
+   592→  if (!token) return null
+   593→
+   594→  try {
+   595→    const res = await fetch(`${UPSTOX_API_V2}/user/profile`, {
+   596→      headers: {
+   597→        'Authorization': `Bearer ${token}`,
+   598→        'Accept': 'application/json',
+   599→      },
+   600→    })
+   601→
+   602→    if (!res.ok) return null
+   603→    const data = await res.json()
+   604→    return data?.data || null
+   605→  } catch {
+   606→    return null
+   607→  }
+   608→}
+   609→
+   610→// ─── Market Data API ────────────────────────────────────────────────────
+   611→
+   612→/**
+   613→ * Get real-time quotes from Upstox
+   614→ */
+   615→export async function getUpstoxQuotes(instrumentKeys: string[]): Promise<UpstoxQuote[]> {
+   616→  const token = await ensureValidToken()
+   617→  if (!token || instrumentKeys.length === 0) return []
+   618→
+   619→  try {
+   620→    const encodedKeys = instrumentKeys.map(k => encodeURIComponent(k)).join(',')
+   621→    const res = await fetch(
+   622→      `${UPSTOX_API_V2}/market-quote/quotes?instrument_key=${encodedKeys}`,
+   623→      {
+   624→        headers: {
+   625→          'Authorization': `Bearer ${token}`,
+   626→          'Accept': 'application/json',
+   627→        },
+   628→        cache: 'no-store',
+   629→        signal: AbortSignal.timeout(15000),
+   630→      }
+   631→    )
+   632→
+   633→    if (!res.ok) {
+   634→      console.warn(`[Upstox] Quotes API returned ${res.status}`)
+   635→      return []
+   636→    }
+   637→    const data = await res.json()
+   638→    if (!data?.data) return []
+   639→
+   640→    // Upstox returns data as object keyed by "NSE_EQ:INE002A01018" or "NSE_INDEX:Nifty 50"
+   641→    return Object.values(data.data) as UpstoxQuote[]
+   642→  } catch (err) {
+   643→    console.warn('[Upstox] Quotes fetch error:', err)
+   644→    return []
+   645→  }
+   646→}
+   647→
+   648→/**
+   649→ * Get single stock quote from Upstox
+   650→ */
+   651→export async function getUpstoxStockQuote(symbol: string): Promise<UpstoxQuote | null> {
+   652→  const eqKey = getInstrumentKey(symbol, 'NSE_EQ')
+   653→  if (!eqKey) return null
+   654→
+   655→  const quotes = await getUpstoxQuotes([eqKey])
+   656→  return quotes.length > 0 ? quotes[0] : null
+   657→}
+   658→
+   659→/**
+   660→ * Get index quote from Upstox
+   661→ */
+   662→export async function getUpstoxIndexQuote(symbol: string): Promise<UpstoxQuote | null> {
+   663→  const indexKey = getInstrumentKey(symbol, 'NSE_INDEX')
+   664→  if (!indexKey) return null
+   665→
+   666→  const quotes = await getUpstoxQuotes([indexKey])
+   667→  return quotes.length > 0 ? quotes[0] : null
+   668→}
+   669→
+   670→/**
+   671→ * Get OHLC data from Upstox
+   672→ */
+   673→export async function getUpstoxOHLC(instrumentKeys: string[]): Promise<UpstoxOHLC[]> {
+   674→  const token = await getAccessToken()
+   675→  if (!token || instrumentKeys.length === 0) return []
+   676→
+   677→  try {
+   678→    const res = await fetch(
+   679→      `${UPSTOX_API_V2}/market-quote/ohlc?instrument_key=${instrumentKeys.join(',')}`,
+   680→      {
+   681→        headers: {
+   682→          'Authorization': `Bearer ${token}`,
+   683→          'Accept': 'application/json',
+   684→        },
+   685→        cache: 'no-store',
+   686→      }
+   687→    )
+   688→
+   689→    if (!res.ok) return []
+   690→    const data = await res.json()
+   691→    if (!data?.data) return []
+   692→
+   693→    return Object.values(data.data) as UpstoxOHLC[]
+   694→  } catch {
+   695→    return []
+   696→  }
+   697→}
+   698→
+   699→/**
+   700→ * Get option chain from Upstox v2 API
+   701→ * NOTE: expiry_date is REQUIRED by the Upstox API
+   702→ * If not provided, we first fetch available expiries and use the nearest one
+   703→ */
+   704→export async function getUpstoxOptionChain(
+   705→  underlyingInstrumentKey: string,
+   706→  expiryDate?: string
+   707→): Promise<UpstoxOptionChain | null> {
+   708→  const token = await ensureValidToken()
+   709→  if (!token) return null
+   710→
+   711→  try {
+   712→    // If no expiry provided, calculate the nearest monthly expiry (last Thursday of current/next month)
+   713→    let expiry = expiryDate
+   714→    if (!expiry) {
+   715→      const now = new Date()
+   716→      // Try last Thursday of current month first
+   717→      for (let m = 0; m < 3; m++) {
+   718→        const monthDate = new Date(now.getFullYear(), now.getMonth() + m + 1, 0)
+   719→        while (monthDate.getDay() !== 4) {
+   720→          monthDate.setDate(monthDate.getDate() - 1)
+   721→        }
+   722→        if (monthDate.getTime() >= now.getTime() - 86400000) {
+   723→          expiry = monthDate.toISOString().split('T')[0]
+   724→          break
+   725→        }
+   726→      }
+   727→      if (!expiry) return null
+   728→    }
+   729→
+   730→    const url = `${UPSTOX_API_V2}/option/chain?instrument_key=${encodeURIComponent(underlyingInstrumentKey)}&expiry_date=${expiry}`
+   731→
+   732→    const res = await fetch(url, {
+   733→      headers: {
+   734→        'Authorization': `Bearer ${token}`,
+   735→        'Accept': 'application/json',
+   736→      },
+   737→      cache: 'no-store',
+   738→      signal: AbortSignal.timeout(15000),
+   739→    })
+   740→
+   741→    if (!res.ok) {
+   742→      console.warn(`[Upstox] Option chain API returned ${res.status} for ${underlyingInstrumentKey}`)
+   743→      return null
+   744→    }
+   745→    const data = await res.json()
+   746→    if (data?.status === 'error') {
+   747→      console.warn(`[Upstox] Option chain API error:`, data.errors)
+   748→      return null
+   749→    }
+   750→
+   751→    const chainData = data?.data
+   752→    if (!Array.isArray(chainData) || chainData.length === 0) return null
+   753→
+   754→    // Transform to our internal format - extract spot price from first item
+   755→    const spotPrice = chainData[0]?.underlying_spot_price || 0
+   756→
+   757→    return {
+   758→      underlying_spot_price: spotPrice,
+   759→      option_chain: chainData as UpstoxOptionChainItem[],
+   760→    }
+   761→  } catch (err) {
+   762→    console.warn(`[Upstox] Option chain error:`, err)
+   763→    return null
+   764→  }
+   765→}
+   766→
+   767→/**
+   768→ * Get historical candle data from Upstox
+   769→ */
+   770→export async function getUpstoxHistoricalData(
+   771→  instrumentKey: string,
+   772→  resolution: string = 'day',
+   773→  fromDate: string,
+   774→  toDate: string
+   775→): Promise<UpstoxHistoricalCandle[]> {
+   776→  const token = await getAccessToken()
+   777→  if (!token) return []
+   778→
+   779→  try {
+   780→    // Upstox URL format: /historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}
+   781→    // to_date is the recent date, from_date is the older date
+   782→    const res = await fetch(
+   783→      `${UPSTOX_API_V2}/historical-candle/${encodeURIComponent(instrumentKey)}/${resolution}/${toDate}/${fromDate}`,
+   784→      {
+   785→        headers: {
+   786→          'Authorization': `Bearer ${token}`,
+   787→          'Accept': 'application/json',
+   788→        },
+   789→      }
+   790→    )
+   791→
+   792→    if (!res.ok) {
+   793→      console.warn(`[Upstox] Historical API returned ${res.status} for ${instrumentKey}`)
+   794→      return []
+   795→    }
+   796→    const data = await res.json()
+   797→    if (data?.status === 'error') {
+   798→      console.warn(`[Upstox] Historical API error:`, data.errors)
+   799→      return []
+   800→    }
+   801→    if (!data?.data?.candles) return []
+   802→
+   803→    // Upstox returns candles as arrays: [timestamp, open, high, low, close, volume, oi]
+   804→    return data.data.candles.map((c: (string | number)[]) => ({
+   805→      timestamp: String(c[0]),
+   806→      open: Number(c[1]),
+   807→      high: Number(c[2]),
+   808→      low: Number(c[3]),
+   809→      close: Number(c[4]),
+   810→      volume: Number(c[5] || 0),
+   811→      oi: Number(c[6] || 0),
+   812→    }))
+   813→  } catch (err) {
+   814→    console.warn(`[Upstox] Historical data error:`, err)
+   815→    return []
+   816→  }
+   817→}
+   818→
+   819→/**
+   820→ * Get expiry dates for an underlying from Upstox
+   821→ * Tries likely NSE expiry dates in parallel to discover available expiries efficiently
+   822→ */
+   823→export async function getUpstoxExpiries(underlyingInstrumentKey: string): Promise<string[]> {
+   824→  const token = await getAccessToken()
+   825→  if (!token) return []
+   826→
+   827→  try {
+   828→    // Generate likely NSE expiry dates (Thursdays)
+   829→    const now = new Date()
+   830→    const candidateDates: string[] = []
+   831→
+   832→    // Generate next 12 Thursdays for weekly options
+   833→    for (let i = 0; i < 12; i++) {
+   834→      const date = new Date(now)
+   835→      date.setDate(date.getDate() + (i * 7))
+   836→      const day = date.getDay()
+   837→      const daysUntilThursday = ((4 - day + 7) % 7)
+   838→      date.setDate(date.getDate() + daysUntilThursday)
+   839→      const dateStr = date.toISOString().split('T')[0]
+   840→      if (!candidateDates.includes(dateStr)) {
+   841→        candidateDates.push(dateStr)
+   842→      }
+   843→    }
+   844→
+   845→    // Add last Thursday of each month for next 6 months
+   846→    for (let m = 0; m < 6; m++) {
+   847→      const monthDate = new Date(now.getFullYear(), now.getMonth() + m + 1, 0)
+   848→      while (monthDate.getDay() !== 4) {
+   849→        monthDate.setDate(monthDate.getDate() - 1)
+   850→      }
+   851→      const dateStr = monthDate.toISOString().split('T')[0]
+   852→      if (!candidateDates.includes(dateStr)) {
+   853→        candidateDates.push(dateStr)
+   854→      }
+   855→    }
+   856→
+   857→    // Try all candidate dates in parallel (with concurrency limit)
+   858→    const BATCH_SIZE = 6
+   859→    const validExpiries: string[] = []
+   860→
+   861→    for (let i = 0; i < candidateDates.length; i += BATCH_SIZE) {
+   862→      const batch = candidateDates.slice(i, i + BATCH_SIZE)
+   863→      const results = await Promise.allSettled(
+   864→        batch.map(async (dateStr) => {
+   865→          const url = `${UPSTOX_API_V2}/option/chain?instrument_key=${encodeURIComponent(underlyingInstrumentKey)}&expiry_date=${dateStr}`
+   866→          const res = await fetch(url, {
+   867→            headers: {
+   868→              'Authorization': `Bearer ${token}`,
+   869→              'Accept': 'application/json',
+   870→            },
+   871→            signal: AbortSignal.timeout(8000),
+   872→          })
+   873→          if (res.ok) {
+   874→            const data = await res.json()
+   875→            if (data?.status === 'success' && Array.isArray(data?.data) && data.data.length > 0) {
+   876→              return dateStr
+   877→            }
+   878→          }
+   879→          return null
+   880→        })
+   881→      )
+   882→
+   883→      for (const result of results) {
+   884→        if (result.status === 'fulfilled' && result.value) {
+   885→          validExpiries.push(result.value)
+   886→        }
+   887→      }
+   888→
+   889→      if (validExpiries.length >= 8) break
+   890→    }
+   891→
+   892→    return validExpiries.sort()
+   893→  } catch {
+   894→    return []
+   895→  }
+   896→}
+   897→
+   898→// ─── Market Data - Multi-index Quotes ──────────────────────────────────
+   899→
+   900→/**
+   901→ * Get all configured index quotes from Upstox
+   902→ */
+   903→export async function getUpstoxAllIndexQuotes(): Promise<UpstoxQuote[]> {
+   904→  // ensureValidToken is called inside getUpstoxQuotes, but we also check here
+   905→  // to avoid the overhead of fetching keys if no token is available
+   906→  const token = await ensureValidToken()
+   907→  if (!token) return []
+   908→  const keys = Object.values(NSE_INDEX_INSTRUMENT_MAP)
+   909→  return getUpstoxQuotes(keys)
+   910→}
+   911→
+   912→/**
+   913→ * Get top NSE stock quotes from Upstox
+   914→ */
+   915→export async function getUpstoxTopStockQuotes(count: number = 50): Promise<UpstoxQuote[]> {
+   916→  const keys = Object.values(NSE_EQ_INSTRUMENT_MAP).slice(0, count)
+   917→  return getUpstoxQuotes(keys)
+   918→}
+   919→
+   920→/**
+   921→ * Get stock quotes as a map keyed by symbol (e.g., "RELIANCE" → UpstoxQuote)
+   922→ * This is the recommended way to fetch quotes when you need to match back to symbols
+   923→ */
+   924→export async function getUpstoxStockQuotesMap(symbols?: string[]): Promise<Record<string, UpstoxQuote>> {
+   925→  const token = await getAccessToken()
+   926→  if (!token) return {}
+   927→
+   928→  const mapToUse = symbols
+   929→    ? Object.fromEntries(Object.entries(NSE_EQ_INSTRUMENT_MAP).filter(([k]) => symbols.includes(k)))
+   930→    : NSE_EQ_INSTRUMENT_MAP
+   931→
+   932→  const keys = Object.values(mapToUse)
+   933→  if (keys.length === 0) return {}
+   934→
+   935→  try {
+   936→    // URL-encode the instrument keys (pipe | needs to be %7C)
+   937→    const encodedKeys = keys.map(k => encodeURIComponent(k)).join(',')
+   938→    const res = await fetch(
+   939→      `${UPSTOX_API_V2}/market-quote/quotes?instrument_key=${encodedKeys}`,
+   940→      {
+   941→        headers: {
+   942→          'Authorization': `Bearer ${token}`,
+   943→          'Accept': 'application/json',
+   944→        },
+   945→        cache: 'no-store',
+   946→        signal: AbortSignal.timeout(15000), // 15s timeout
+   947→      }
+   948→    )
+   949→
+   950→    if (!res.ok) return {}
+   951→    const data = await res.json()
+   952→    if (!data?.data) return {}
+   953→
+   954→    // Upstox response keys are in format "NSE_EQ:RELIANCE" (segment:symbol)
+   955→    // We need to match our symbol names to the response keys
+   956→    const result: Record<string, UpstoxQuote> = {}
+   957→    for (const [symbol, instrumentKey] of Object.entries(mapToUse)) {
+   958→      // Try multiple key formats: "NSE_EQ:SYMBOL", "NSE_INDEX:Nifty 50", and the pipe version
+   959→      const possibleKeys = [
+   960→        `${instrumentKey.replace('|', ':')}`,  // NSE_EQ:INE002A01018 (unlikely but check)
+   961→        instrumentKey,                          // NSE_EQ|INE002A01018 (pipe format)
+   962→      ]
+   963→      // Also try the segment:symbol format (most common in Upstox responses)
+   964→      const segment = instrumentKey.split('|')[0] // NSE_EQ, NSE_INDEX, BSE_INDEX
+   965→      const segmentSymbolKey = `${segment}:${symbol}`  // NSE_EQ:RELIANCE
+   966→      possibleKeys.unshift(segmentSymbolKey)
+   967→
+   968→      let quoteData = null
+   969→      for (const key of possibleKeys) {
+   970→        if (data.data[key]) {
+   971→          quoteData = data.data[key]
+   972→          break
+   973→        }
+   974→      }
+   975→      if (quoteData) {
+   976→        result[symbol] = quoteData as UpstoxQuote
+   977→      }
+   978→    }
+   979→
+   980→    return result
+   981→  } catch (err) {
+   982→    console.warn('[Upstox] Stock quotes map error:', err)
+   983→    return {}
+   984→  }
+   985→}
+   986→
+   987→/**
+   988→ * Get index quotes as a map keyed by symbol (e.g., "NIFTY" → UpstoxQuote)
+   989→ */
+   990→export async function getUpstoxIndexQuotesMap(symbols?: string[]): Promise<Record<string, UpstoxQuote>> {
+   991→  const token = await getAccessToken()
+   992→  if (!token) return {}
+   993→
+   994→  const mapToUse = symbols
+   995→    ? Object.fromEntries(Object.entries(NSE_INDEX_INSTRUMENT_MAP).filter(([k]) => symbols.includes(k)))
+   996→    : NSE_INDEX_INSTRUMENT_MAP
+   997→
+   998→  const keys = Object.values(mapToUse)
+   999→  if (keys.length === 0) return {}
+  1000→
+  1001→  try {
+  1002→    const encodedKeys = keys.map(k => encodeURIComponent(k)).join(',')
+  1003→    const res = await fetch(
+  1004→      `${UPSTOX_API_V2}/market-quote/quotes?instrument_key=${encodedKeys}`,
+  1005→      {
+  1006→        headers: {
+  1007→          'Authorization': `Bearer ${token}`,
+  1008→          'Accept': 'application/json',
+  1009→        },
+  1010→        cache: 'no-store',
+  1011→        signal: AbortSignal.timeout(15000), // 15s timeout
+  1012→      }
+  1013→    )
+  1014→
+  1015→    if (!res.ok) return {}
+  1016→    const data = await res.json()
+  1017→    if (!data?.data) return {}
+  1018→
+  1019→    // Upstox response keys for indices: "NSE_INDEX:Nifty 50", "NSE_INDEX:Nifty Bank", "BSE_INDEX:SENSEX"
+  1020→    // Our instrument keys: "NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank", "BSE_INDEX|SENSEX"
+  1021→    const result: Record<string, UpstoxQuote> = {}
+  1022→    for (const [symbol, instrumentKey] of Object.entries(mapToUse)) {
+  1023→      const possibleKeys = [
+  1024→        instrumentKey.replace('|', ':'),  // NSE_INDEX:Nifty 50 (most likely!)
+  1025→        instrumentKey,                    // NSE_INDEX|Nifty 50
+  1026→      ]
+  1027→      // Also try segment:symbol for index
+  1028→      const segment = instrumentKey.split('|')[0]
+  1029→      possibleKeys.unshift(`${segment}:${symbol}`)
+  1030→
+  1031→      let quoteData = null
+  1032→      for (const key of possibleKeys) {
+  1033→        if (data.data[key]) {
+  1034→          quoteData = data.data[key]
+  1035→          break
+  1036→        }
+  1037→      }
+  1038→      if (quoteData) {
+  1039→        result[symbol] = quoteData as UpstoxQuote
+  1040→      }
+  1041→    }
+  1042→
+  1043→    return result
+  1044→  } catch (err) {
+  1045→    console.warn('[Upstox] Index quotes map error:', err)
+  1046→    return {}
+  1047→  }
+  1048→}
+  1049→
+  1050→// ─── Yahoo Finance Fallback ──────────────────────────────────────────────
+  1051→
+  1052→function getYahooSymbol(symbol: string): string {
+  1053→  return `${symbol}.NS`
+  1054→}
+  1055→
+  1056→// Index symbol mapping for Yahoo Finance
+  1057→const YAHOO_INDEX_MAP: Record<string, string> = {
+  1058→  NIFTY: '^NSEI',
+  1059→  BANKNIFTY: '^NSEBANK',
+  1060→  FINNIFTY: '^CNXFIN',
+  1061→  SENSEX: '^BSESN',
+  1062→  MIDCPNIFTY: '^NSMIDCAP',
+  1063→}
+  1064→
+  1065→/**
+  1066→ * Direct Yahoo Finance v8 chart API - reliable, no auth needed, returns real-time data
+  1067→ */
+  1068→export async function getYahooDirectQuote(symbol: string): Promise<{
+  1069→  last_price: number
+  1070→  net_change: number
+  1071→  ohlc: { open: number; high: number; low: number; close: number }
+  1072→  volume: number | null
+  1073→  marketCap: number
+  1074→  week52High: number
+  1075→  week52Low: number
+  1076→  peRatio: number | null
+  1077→  eps: number
+  1078→  dividendYield: number
+  1079→  pbRatio: number
+  1080→  name: string
+  1081→} | null> {
+  1082→  try {
+  1083→    // Check if it's an index
+  1084→    const isIndex = !!YAHOO_INDEX_MAP[symbol.toUpperCase()]
+  1085→    const yahooSym = isIndex
+  1086→      ? YAHOO_INDEX_MAP[symbol.toUpperCase()]
+  1087→      : `${symbol.toUpperCase()}.NS`
+  1088→
+  1089→    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1m&range=1d`
+  1090→    const res = await fetch(url, {
+  1091→      headers: {
+  1092→        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  1093→        'Accept': 'application/json',
+  1094→      },
+  1095→      signal: AbortSignal.timeout(8000),
+  1096→    })
+  1097→
+  1098→    if (!res.ok) return null
+  1099→    const json: any = await res.json()
+  1100→    const meta = json?.chart?.result?.[0]?.meta
+  1101→    if (!meta || !meta.regularMarketPrice) return null
+  1102→
+  1103→    const price = meta.regularMarketPrice
+  1104→    const prevClose = meta.previousClose || meta.chartPreviousClose || price
+  1105→
+  1106→    return {
+  1107→      last_price: price,
+  1108→      net_change: price - prevClose,
+  1109→      ohlc: {
+  1110→        open: meta.regularMarketOpen || prevClose,
+  1111→        high: meta.regularMarketDayHigh || price,
+  1112→        low: meta.regularMarketDayLow || price,
+  1113→        close: prevClose,
+  1114→      },
+  1115→      volume: meta.regularMarketVolume || null,
+  1116→      marketCap: 0,
+  1117→      week52High: meta.fiftyTwoWeekHigh || 0,
+  1118→      week52Low: meta.fiftyTwoWeekLow || 0,
+  1119→      peRatio: null,
+  1120→      eps: 0,
+  1121→      dividendYield: 0,
+  1122→      pbRatio: 0,
+  1123→      name: meta.symbol || symbol,
+  1124→    }
+  1125→  } catch {
+  1126→    return null
+  1127→  }
+  1128→}
+  1129→
+  1130→export async function getFinanceQuote(symbol: string): Promise<Record<string, unknown> | null> {
+  1131→  // Try direct Yahoo Finance API first (more reliable)
+  1132→  try {
+  1133→    const directQuote = await getYahooDirectQuote(symbol)
+  1134→    if (directQuote && directQuote.last_price > 0) {
+  1135→      // Convert to the format expected by fetchStockOverviewData
+  1136→      return {
+  1137→        regularMarketPrice: { raw: directQuote.last_price },
+  1138→        regularMarketPreviousClose: { raw: directQuote.ohlc.close },
+  1139→        regularMarketOpen: { raw: directQuote.ohlc.open },
+  1140→        regularMarketDayHigh: { raw: directQuote.ohlc.high },
+  1141→        regularMarketDayLow: { raw: directQuote.ohlc.low },
+  1142→        regularMarketVolume: { raw: directQuote.volume },
+  1143→        fiftyTwoWeekHigh: { raw: directQuote.week52High },
+  1144→        fiftyTwoWeekLow: { raw: directQuote.week52Low },
+  1145→        marketCap: { raw: directQuote.marketCap },
+  1146→        shortName: directQuote.name,
+  1147→      } as unknown as Record<string, unknown>
+  1148→    }
+  1149→  } catch {
+  1150→    // Fall through to gateway
+  1151→  }
+  1152→
+  1153→  // Fallback: Try internal finance gateway
+  1154→  try {
+  1155→    const yahooSym = getYahooSymbol(symbol)
+  1156→    const res = await fetch(
+  1157→      `${FINANCE_GATEWAY}${FINANCE_PREFIX}/v1/markets/quote?ticker=${encodeURIComponent(yahooSym)}&type=STOCKS`,
+  1158→      { headers: { 'X-Z-AI-From': 'Z' }, cache: 'no-store' }
+  1159→    )
+  1160→
+  1161→    if (!res.ok) return null
+  1162→    const json = await res.json()
+  1163→    return json?.body || null
+  1164→  } catch {
+  1165→    return null
+  1166→  }
+  1167→}
+  1168→
+  1169→export async function getFinanceHistoricalData(
+  1170→  symbol: string,
+  1171→  interval: string = '1d',
+  1172→  limit: number = 30
+  1173→): Promise<UpstoxHistoricalCandle[]> {
+  1174→  try {
+  1175→    const yahooSym = getYahooSymbol(symbol)
+  1176→    const res = await fetch(
+  1177→      `${FINANCE_GATEWAY}${FINANCE_PREFIX}/v2/markets/stock/history?symbol=${encodeURIComponent(yahooSym)}&interval=${interval}&limit=${limit}`,
+  1178→      { headers: { 'X-Z-AI-From': 'Z' }, cache: 'no-store' }
+  1179→    )
+  1180→
+  1181→    if (!res.ok) return []
+  1182→    const json = await res.json()
+  1183→    const body = json?.body
+  1184→
+  1185→    if (!Array.isArray(body) || body.length === 0) return []
+  1186→
+  1187→    return body.map((candle: Record<string, unknown>) => ({
+  1188→      timestamp: String(candle.date || candle.timestamp || ''),
+  1189→      open: parseFloat(String(candle.open || '0')),
+  1190→      high: parseFloat(String(candle.high || '0')),
+  1191→      low: parseFloat(String(candle.low || '0')),
+  1192→      close: parseFloat(String(candle.close || '0')),
+  1193→      volume: parseInt(String(candle.volume || '0')),
+  1194→      oi: 0,
+  1195→    })).filter((c) => c.close > 0)
+  1196→  } catch {
+  1197→    return []
+  1198→  }
+  1199→}
+  1200→
+  1201→// ─── Combined Data Fetchers ───────────────────────────────────────────────
+  1202→// These try Upstox → Dhan → Yahoo Finance → DB fallback
+  1203→
+  1204→export interface StockOverviewData {
+  1205→  symbol: string
+  1206→  name: string
+  1207→  sector: string
+  1208→  industry: string
+  1209→  exchange: string
+  1210→  isin: string | null
+  1211→
+  1212→  currentPrice: number
+  1213→  change: number
+  1214→  changePercent: number
+  1215→  open: number
+  1216→  high: number
+  1217→  low: number
+  1218→  previousClose: number
+  1219→  close: number
+  1220→  volume: number
+  1221→  totalTradedValue: number
+  1222→  averageTradePrice: number
+  1223→
+  1224→  week52High: number
+  1225→  week52Low: number
+  1226→
+  1227→  upperCircuit: number
+  1228→  lowerCircuit: number
+  1229→
+  1230→  marketCap: number
+  1231→  peRatio: number | null
+  1232→  eps: number
+  1233→  dividendYield: number
+  1234→  pbRatio: number
+  1235→  roe: number
+  1236→  bookValue: number
+  1237→  debtToEquity: number
+  1238→  faceValue: number
+  1239→  industryPE: number
+  1240→
+  1241→  lotSize: number
+  1242→  isFuturesAvailable: boolean
+  1243→  isOptionsAvailable: boolean
+  1244→  isFnoBan: boolean
+  1245→  strikeInterval: number | null
+  1246→
+  1247→  deliveryQuantity: number | null
+  1248→  deliveryPercentage: number | null
+  1249→  vwap: number | null
+  1250→
+  1251→  isRealData: boolean
+  1252→  dataSource: 'upstox' | 'dhan' | 'yahoo' | 'database'
+  1253→}
+  1254→
+  1255→export interface IndexDetailData {
+  1256→  symbol: string
+  1257→  name: string
+  1258→  currentPrice: number
+  1259→  change: number
+  1260→  changePercent: number
+  1261→  open: number
+  1262→  high: number
+  1263→  low: number
+  1264→  previousClose: number
+  1265→  volume: number
+  1266→  week52High: number
+  1267→  week52Low: number
+  1268→  lotSize: number
+  1269→  strikeInterval: number
+  1270→  marketState: string
+  1271→  exchange: string
+  1272→  currency: string
+  1273→  isRealData: boolean
+  1274→  dataSource: 'upstox' | 'dhan' | 'yahoo' | 'fallback'
+  1275→}
+  1276→
+  1277→/**
+  1278→ * Fetch comprehensive stock overview data
+  1279→ * Priority: Upstox → Dhan → Yahoo Finance → DB
+  1280→ */
+  1281→export async function fetchStockOverviewData(symbol: string, dbStock: Record<string, unknown> | null): Promise<StockOverviewData> {
+  1282→  const symbolUpper = symbol.toUpperCase()
+  1283→  let dataSource: 'upstox' | 'dhan' | 'yahoo' | 'database' = 'database'
+  1284→  let realtimeData: Partial<StockOverviewData> = {}
+  1285→
+  1286→  // 1. Try Upstox API first
+  1287→  if (await isUpstoxAuthenticated()) {
+  1288→    try {
+  1289→      const upstoxQuote = await getUpstoxStockQuote(symbolUpper)
+  1290→      if (upstoxQuote && upstoxQuote.last_price > 0) {
+  1291→        dataSource = 'upstox'
+  1292→        const previousClose = upstoxQuote.ohlc.close - upstoxQuote.net_change
+  1293→        const changePercent = previousClose > 0 ? (upstoxQuote.net_change / previousClose) * 100 : 0
+  1294→        realtimeData = {
+  1295→          currentPrice: upstoxQuote.last_price,
+  1296→          open: upstoxQuote.ohlc.open,
+  1297→          high: upstoxQuote.ohlc.high,
+  1298→          low: upstoxQuote.ohlc.low,
+  1299→          close: upstoxQuote.ohlc.close,
+  1300→          previousClose,
+  1301→          change: upstoxQuote.net_change,
+  1302→          changePercent,
+  1303→          volume: upstoxQuote.volume || 0,
+  1304→          averageTradePrice: upstoxQuote.average_price || 0,
+  1305→          week52High: 0, // Not available in Upstox quote
+  1306→          week52Low: 0,  // Not available in Upstox quote
+  1307→          upperCircuit: upstoxQuote.upper_circuit_limit || 0,
+  1308→          lowerCircuit: upstoxQuote.lower_circuit_limit || 0,
+  1309→          isRealData: true,
+  1310→        }
+  1311→      }
+  1312→    } catch (err) {
+  1313→      console.warn(`[Upstox] Quote fetch failed for ${symbolUpper}:`, err)
+  1314→    }
+  1315→  }
+  1316→
+  1317→  // 2. Try Dhan API if Upstox didn't work
+  1318→  if (dataSource === 'database') {
+  1319→    try {
+  1320→      const { isDhanConfigured: isDhan, getDhanStockQuote } = await import('./dhan-api')
+  1321→      if (isDhan()) {
+  1322→        const dhanQuote = await getDhanStockQuote(symbolUpper)
+  1323→        if (dhanQuote && dhanQuote.ltp > 0) {
+  1324→          dataSource = 'dhan'
+  1325→          realtimeData = {
+  1326→            currentPrice: dhanQuote.ltp,
+  1327→            open: dhanQuote.open,
+  1328→            high: dhanQuote.high,
+  1329→            low: dhanQuote.low,
+  1330→            close: dhanQuote.close,
+  1331→            previousClose: dhanQuote.previousClose,
+  1332→            change: dhanQuote.change,
+  1333→            changePercent: dhanQuote.changePercent,
+  1334→            volume: dhanQuote.volume,
+  1335→            totalTradedValue: dhanQuote.totalTradedValue,
+  1336→            averageTradePrice: dhanQuote.averageTradePrice,
+  1337→            week52High: dhanQuote.week52High,
+  1338→            week52Low: dhanQuote.week52Low,
+  1339→            upperCircuit: dhanQuote.upperCircuit,
+  1340→            lowerCircuit: dhanQuote.lowerCircuit,
+  1341→            marketCap: dhanQuote.marketCap,
+  1342→            isRealData: true,
+  1343→          }
+  1344→        }
+  1345→      }
+  1346→    } catch (err) {
+  1347→      console.warn(`[Dhan] Quote fetch failed for ${symbolUpper}:`, err)
+  1348→    }
+  1349→  }
+  1350→
+  1351→  // 3. Try Yahoo Finance if still no data
+  1352→  if (dataSource === 'database') {
+  1353→    try {
+  1354→      const yahooData = await getFinanceQuote(symbolUpper)
+  1355→      if (yahooData) {
+  1356→        dataSource = 'yahoo'
+  1357→        const currentPrice = parseFloat(String(yahooData.regularMarketPrice?.raw || yahooData.regularMarketPrice || '0'))
+  1358→        const previousClose = parseFloat(String(yahooData.regularMarketPreviousClose?.raw || yahooData.regularMarketPreviousClose || '0'))
+  1359→        const change = currentPrice - previousClose
+  1360→        const changePercent = previousClose > 0 ? (change / previousClose) * 100 : 0
+  1361→
+  1362→        realtimeData = {
+  1363→          currentPrice,
+  1364→          previousClose,
+  1365→          change,
+  1366→          changePercent,
+  1367→          open: parseFloat(String(yahooData.regularMarketOpen?.raw || yahooData.regularMarketOpen || '0')),
+  1368→          high: parseFloat(String(yahooData.regularMarketDayHigh?.raw || yahooData.regularMarketDayHigh || '0')),
+  1369→          low: parseFloat(String(yahooData.regularMarketDayLow?.raw || yahooData.regularMarketDayLow || '0')),
+  1370→          volume: parseInt(String(yahooData.regularMarketVolume?.raw || yahooData.regularMarketVolume || '0')),
+  1371→          week52High: parseFloat(String(yahooData.fiftyTwoWeekHigh?.raw || yahooData.fiftyTwoWeekHigh || '0')),
+  1372→          week52Low: parseFloat(String(yahooData.fiftyTwoWeekLow?.raw || yahooData.fiftyTwoWeekLow || '0')),
+  1373→          marketCap: parseFloat(String(yahooData.marketCap?.raw || yahooData.marketCap || '0')),
+  1374→          peRatio: parseFloat(String(yahooData.trailingPE?.raw || yahooData.trailingPE || dbStock?.peRatio || 0)) || null,
+  1375→          eps: parseFloat(String(yahooData.epsTrailingTwelveMonths?.raw || yahooData.epsTrailingTwelveMonths || '0')),
+  1376→          dividendYield: parseFloat(String(yahooData.dividendYield?.raw || yahooData.dividendYield || (dbStock?.dividendYield ? (dbStock.dividendYield as number) * 100 : 0) || 0)) / 100,
+  1377→          pbRatio: parseFloat(String(yahooData.priceToBook?.raw || yahooData.priceToBook || '0')),
+  1378→          roe: parseFloat(String(yahooData.returnOnEquity?.raw || yahooData.returnOnEquity || '0')) * 100,
+  1379→          bookValue: parseFloat(String(yahooData.bookValue?.raw || yahooData.bookValue || '0')),
+  1380→          debtToEquity: parseFloat(String(yahooData.debtToEquity?.raw || yahooData.debtToEquity || '0')),
+  1381→          name: String(yahooData.shortName || dbStock?.name || symbolUpper),
+  1382→          isRealData: true,
+  1383→        }
+  1384→      }
+  1385→    } catch {
+  1386→      // Fall through to DB
+  1387→    }
+  1388→  }
+  1389→
+  1390→  // 4. Merge with DB data
+  1391→  const result: StockOverviewData = {
+  1392→    symbol: symbolUpper,
+  1393→    name: (realtimeData.name as string) || (dbStock?.name as string) || symbolUpper,
+  1394→    sector: (dbStock?.sector as string) || '',
+  1395→    industry: (dbStock?.industry as string) || '',
+  1396→    exchange: (dbStock?.exchange as string) || 'NSE',
+  1397→    isin: (dbStock?.isin as string) || null,
+  1398→
+  1399→    currentPrice: (realtimeData.currentPrice as number) || (dbStock?.currentPrice as number) || 0,
+  1400→    change: (realtimeData.change as number) || (dbStock?.change as number) || 0,
+  1401→    changePercent: (realtimeData.changePercent as number) || (dbStock?.changePercent as number) || 0,
+  1402→    open: (realtimeData.open as number) || (dbStock?.open as number) || 0,
+  1403→    high: (realtimeData.high as number) || (dbStock?.high as number) || 0,
+  1404→    low: (realtimeData.low as number) || (dbStock?.low as number) || 0,
+  1405→    previousClose: (realtimeData.previousClose as number) || (dbStock?.previousClose as number) || 0,
+  1406→    close: (realtimeData.close as number) || (realtimeData.currentPrice as number) || (dbStock?.currentPrice as number) || 0,
+  1407→    volume: (realtimeData.volume as number) || (dbStock?.volume as number) || 0,
+  1408→    totalTradedValue: (realtimeData.totalTradedValue as number) || 0,
+  1409→    averageTradePrice: (realtimeData.averageTradePrice as number) || 0,
+  1410→
+  1411→    week52High: (realtimeData.week52High as number) || (dbStock?.week52High as number) || 0,
+  1412→    week52Low: (realtimeData.week52Low as number) || (dbStock?.week52Low as number) || 0,
+  1413→
+  1414→    upperCircuit: (realtimeData.upperCircuit as number) || 0,
+  1415→    lowerCircuit: (realtimeData.lowerCircuit as number) || 0,
+  1416→
+  1417→    marketCap: (realtimeData.marketCap as number) || (dbStock?.marketCap as number) || 0,
+  1418→    peRatio: (realtimeData.peRatio as number) || (dbStock?.peRatio as number) || null,
+  1419→    eps: (realtimeData.eps as number) || 0,
+  1420→    dividendYield: (realtimeData.dividendYield as number) || (dbStock?.dividendYield as number) || 0,
+  1421→    pbRatio: (realtimeData.pbRatio as number) || 0,
+  1422→    roe: (realtimeData.roe as number) || 0,
+  1423→    bookValue: (realtimeData.bookValue as number) || 0,
+  1424→    debtToEquity: (realtimeData.debtToEquity as number) || 0,
+  1425→    faceValue: (realtimeData.faceValue as number) || (dbStock?.faceValue as number) || 10,
+  1426→    industryPE: (realtimeData.industryPE as number) || 0,
+  1427→
+  1428→    lotSize: (dbStock?.lotSize as number) || 1,
+  1429→    isFuturesAvailable: (dbStock?.isFuturesAvailable as boolean) || false,
+  1430→    isOptionsAvailable: (dbStock?.isOptionsAvailable as boolean) || false,
+  1431→    isFnoBan: (dbStock?.isFnoBan as boolean) || false,
+  1432→    strikeInterval: (dbStock?.strikeInterval as number) || null,
+  1433→
+  1434→    deliveryQuantity: null,
+  1435→    deliveryPercentage: null,
+  1436→    vwap: (realtimeData.vwap as number) || null,
+  1437→
+  1438→    isRealData: dataSource !== 'database',
+  1439→    dataSource,
+  1440→  }
+  1441→
+  1442→  return result
+  1443→}
+  1444→
+  1445→/**
+  1446→ * Fetch index detail data
+  1447→ * Priority: Upstox → Yahoo Finance → Fallback
+  1448→ */
+  1449→// Alias map: common alternative names → canonical keys
+  1450→const INDEX_ALIASES: Record<string, string> = {
+  1451→  'NIFTY 50': 'NIFTY',
+  1452→  'NIFTY50': 'NIFTY',
+  1453→  'BANK NIFTY': 'BANKNIFTY',
+  1454→  'BANKNIFTY': 'BANKNIFTY',
+  1455→  'FIN NIFTY': 'FINNIFTY',
+  1456→  'FINNIFTY': 'FINNIFTY',
+  1457→  'MIDCAP NIFTY': 'MIDCPNIFTY',
+  1458→  'MIDCAPNIFTY': 'MIDCPNIFTY',
+  1459→  'NIFTY MIDCAP 150': 'MIDCPNIFTY',
+  1460→  'NIFTY FINANCIAL SERVICES': 'FINNIFTY',
+  1461→  'NIFTY BANK': 'BANKNIFTY',
+  1462→}
+  1463→
+  1464→function resolveIndexSymbol(symbol: string): string {
+  1465→  const upper = symbol.toUpperCase()
+  1466→  return INDEX_ALIASES[upper] || (INDEX_CONFIGS[upper] ? upper : upper)
+  1467→}
+  1468→
+  1469→export async function fetchIndexDetailData(symbol: string): Promise<IndexDetailData | null> {
+  1470→  const resolvedSymbol = resolveIndexSymbol(symbol)
+  1471→  const symbolUpper = resolvedSymbol.toUpperCase()
+  1472→  const indexConfig = INDEX_CONFIGS[symbolUpper]
+  1473→  if (!indexConfig) return null
+  1474→
+  1475→  // 1. Try Upstox
+  1476→  if (await isUpstoxAuthenticated()) {
+  1477→    try {
+  1478→      const upstoxQuote = await getUpstoxIndexQuote(symbolUpper)
+  1479→      if (upstoxQuote && upstoxQuote.last_price > 0) {
+  1480→        const previousClose = upstoxQuote.ohlc.close - upstoxQuote.net_change
+  1481→        const changePercent = previousClose > 0 ? (upstoxQuote.net_change / previousClose) * 100 : 0
+  1482→        return {
+  1483→          symbol: symbolUpper,
+  1484→          name: indexConfig.name,
+  1485→          currentPrice: upstoxQuote.last_price,
+  1486→          change: upstoxQuote.net_change,
+  1487→          changePercent,
+  1488→          open: upstoxQuote.ohlc.open,
+  1489→          high: upstoxQuote.ohlc.high,
+  1490→          low: upstoxQuote.ohlc.low,
+  1491→          previousClose,
+  1492→          volume: upstoxQuote.volume || 0,
+  1493→          week52High: 0,
+  1494→          week52Low: 0,
+  1495→          lotSize: indexConfig.lotSize,
+  1496→          strikeInterval: indexConfig.strikeInterval,
+  1497→          marketState: 'OPEN',
+  1498→          exchange: 'NSE',
+  1499→          currency: 'INR',
+  1500→          isRealData: true,
+  1501→          dataSource: 'upstox',
+  1502→        }
+  1503→      }
+  1504→    } catch (err) {
+  1505→      console.warn(`[Upstox] Index quote failed for ${symbolUpper}:`, err)
+  1506→    }
+  1507→  }
+  1508→
+  1509→  // 2. Try Yahoo Finance
+  1510→  try {
+  1511→    const yahooSym = indexConfig.yahoo
+  1512→    const res = await fetch(
+  1513→      `${FINANCE_GATEWAY}${FINANCE_PREFIX}/v1/markets/quote?ticker=${encodeURIComponent(yahooSym)}&type=STOCKS`,
+  1514→      { headers: { 'X-Z-AI-From': 'Z' }, cache: 'no-store' }
+  1515→    )
+  1516→
+  1517→    if (res.ok) {
+  1518→      const quoteData = await res.json()
+  1519→      const body = quoteData?.body
+  1520→
+  1521→      if (body) {
+  1522→        const currentPrice = parseFloat(body.regularMarketPrice?.raw || body.regularMarketPrice || '0')
+  1523→        const previousClose = parseFloat(body.regularMarketPreviousClose?.raw || body.regularMarketPreviousClose || '0')
+  1524→        const change = currentPrice - previousClose
+  1525→        const changePercent = previousClose > 0 ? (change / previousClose) * 100 : 0
+  1526→
+  1527→        return {
+  1528→          symbol: symbolUpper,
+  1529→          name: body.shortName || indexConfig.name,
+  1530→          currentPrice,
+  1531→          change,
+  1532→          changePercent,
+  1533→          open: parseFloat(body.regularMarketOpen?.raw || body.regularMarketOpen || '0'),
+  1534→          high: parseFloat(body.regularMarketDayHigh?.raw || body.regularMarketDayHigh || '0'),
+  1535→          low: parseFloat(body.regularMarketDayLow?.raw || body.regularMarketDayLow || '0'),
+  1536→          previousClose,
+  1537→          volume: parseInt(body.regularMarketVolume?.raw || body.regularMarketVolume || '0'),
+  1538→          week52High: parseFloat(body.fiftyTwoWeekHigh?.raw || body.fiftyTwoWeekHigh || '0'),
+  1539→          week52Low: parseFloat(body.fiftyTwoWeekLow?.raw || body.fiftyTwoWeekLow || '0'),
+  1540→          lotSize: indexConfig.lotSize,
+  1541→          strikeInterval: indexConfig.strikeInterval,
+  1542→          marketState: body.marketState || 'CLOSED',
+  1543→          exchange: body.fullExchangeName || 'NSI',
+  1544→          currency: body.currency || 'INR',
+  1545→          isRealData: true,
+  1546→          dataSource: 'yahoo',
+  1547→        }
+  1548→      }
+  1549→    }
+  1550→  } catch (apiErr) {
+  1551→    console.warn(`[Finance API] Index quote error for ${symbolUpper}:`, apiErr)
+  1552→  }
+  1553→
+  1554→  // 3. Fallback
+  1555→  const fallback = INDEX_FALLBACK_DATA[symbolUpper]
+  1556→  if (fallback) {
+  1557→    return { ...fallback, isRealData: false, dataSource: 'fallback' }
+  1558→  }
+  1559→
+  1560→  return null
+  1561→}
+  1562→
+  1563→// ─── Index Configuration ────────────────────────────────────────────────
+  1564→
+  1565→const INDEX_CONFIGS: Record<string, { yahoo: string; name: string; lotSize: number; strikeInterval: number }> = {
+  1566→  NIFTY: { yahoo: '^NSEI', name: 'NIFTY 50', lotSize: 50, strikeInterval: 50 },
+  1567→  BANKNIFTY: { yahoo: '^NSEBANK', name: 'BANK NIFTY', lotSize: 25, strikeInterval: 100 },
+  1568→  SENSEX: { yahoo: '^BSESN', name: 'SENSEX', lotSize: 15, strikeInterval: 100 },
+  1569→  FINNIFTY: { yahoo: '^CRSLDX', name: 'FINNIFTY', lotSize: 40, strikeInterval: 50 },
+  1570→  MIDCPNIFTY: { yahoo: '^NSMIDCP', name: 'MIDCAP NIFTY', lotSize: 75, strikeInterval: 50 },
+  1571→}
+  1572→
+  1573→const INDEX_FALLBACK_DATA: Record<string, IndexDetailData> = {
+  1574→  NIFTY: { symbol: 'NIFTY', name: 'NIFTY 50', currentPrice: 22456.80, change: 142.30, changePercent: 0.64, open: 22350.00, high: 22510.45, low: 22310.20, previousClose: 22314.50, volume: 285600000, week52High: 24234.00, week52Low: 19170.00, lotSize: 50, strikeInterval: 50, marketState: 'CLOSED', exchange: 'NSE', currency: 'INR', isRealData: false, dataSource: 'fallback' },
+  1575→  BANKNIFTY: { symbol: 'BANKNIFTY', name: 'BANK NIFTY', currentPrice: 47210.45, change: -82.10, changePercent: -0.17, open: 47350.00, high: 47480.30, low: 47050.60, previousClose: 47292.55, volume: 198400000, week52High: 51945.00, week52Low: 39450.00, lotSize: 25, strikeInterval: 100, marketState: 'CLOSED', exchange: 'NSE', currency: 'INR', isRealData: false, dataSource: 'fallback' },
+  1576→  SENSEX: { symbol: 'SENSEX', name: 'SENSEX', currentPrice: 73645.25, change: 450.15, changePercent: 0.61, open: 73250.00, high: 73810.50, low: 73180.30, previousClose: 73195.10, volume: 312000000, week52High: 79840.00, week52Low: 62830.00, lotSize: 15, strikeInterval: 100, marketState: 'CLOSED', exchange: 'BSE', currency: 'INR', isRealData: false, dataSource: 'fallback' },
+  1577→  FINNIFTY: { symbol: 'FINNIFTY', name: 'FINNIFTY', currentPrice: 21150.75, change: 85.75, changePercent: 0.41, open: 21080.00, high: 21220.40, low: 21050.10, previousClose: 21065.00, volume: 45200000, week52High: 22980.00, week52Low: 18350.00, lotSize: 40, strikeInterval: 50, marketState: 'CLOSED', exchange: 'NSE', currency: 'INR', isRealData: false, dataSource: 'fallback' },
+  1578→  MIDCPNIFTY: { symbol: 'MIDCPNIFTY', name: 'MIDCAP NIFTY', currentPrice: 51250.10, change: 40.10, changePercent: 0.08, open: 51200.00, high: 51380.50, low: 51100.30, previousClose: 51210.00, volume: 78500000, week52High: 56890.00, week52Low: 42350.00, lotSize: 75, strikeInterval: 50, marketState: 'CLOSED', exchange: 'NSE', currency: 'INR', isRealData: false, dataSource: 'fallback' },
+  1579→}
+  1580→
